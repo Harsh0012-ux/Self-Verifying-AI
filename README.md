@@ -51,10 +51,10 @@ This project's claim: verification should be **experimental**, not textual. Gene
 
 | Page | Screenshot |
 |---|---|
-| Home | `![Home](docs/screenshots/home-dark.png)` |
-| Interactive Verification Studio | `![Interactive](docs/screenshots/interactive-results-dark.png)` |
-| HumanEval Benchmark Demo | `![HumanEval Demo](docs/screenshots/humaneval-results-dark.png)` |
-| Candidate loading state | `![Loading](docs/screenshots/interactive-loading-skeleton.png)` |
+| Home | ![Home](docs/screenshots/home-dark.png) |
+| Interactive Verification Studio | ![Interactive](docs/screenshots/interactive-results-dark.png) |
+| HumanEval Benchmark Demo | ![HumanEval Demo](docs/screenshots/humaneval-results-dark.png) |
+| Candidate loading state | ![Loading](docs/screenshots/interactive-loading-skeleton.png) |
 
 ## Architecture
 
