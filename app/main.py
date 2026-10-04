@@ -646,13 +646,6 @@ def home_page():
 def interactive_page():
     content = '''<h1>Interactive code verification</h1><p class="subtitle">Candidate code is always executed in the restricted Docker sandbox.</p><label>Question<textarea id="question" required placeholder="Describe the function or bug to solve"></textarea></label><label>Existing code (optional)<textarea id="code" placeholder="Paste existing or partially broken code here"></textarea></label><label>Test assertions, one Python assert per line (optional)<textarea id="tests" placeholder="assert add(2, 3) == 5"></textarea></label><button id="run-interactive" class="primary">Generate and verify</button><div id="interactive-results" aria-live="polite"></div>'''
     script = '''<script>
-const _origQS=Document.prototype.querySelector,_origQSA=Document.prototype.querySelectorAll,_origGEBI=Document.prototype.getElementById;
-const idAliases={'q':'question','c':'code','t':'tests','go':'run-interactive','r':'interactive-results'};
-Document.prototype.querySelector=function(s){if(s==='#q')return document.getElementById('question');if(s==='#c')return document.getElementById('code');if(s==='#t')return document.getElementById('tests');if(s==='#go')return document.getElementById('run-interactive');if(s==='#r')return document.getElementById('interactive-results');if(s.startsWith('#r ')){const r=document.getElementById('interactive-results');return r?r.querySelector(s.slice(3)):null;}return _origQS.call(this,s);};
-Document.prototype.querySelectorAll=function(s){if(s.startsWith('#r ')){const r=document.getElementById('interactive-results');return r?r.querySelectorAll(s.slice(3)):[];}return _origQSA.call(this,s);};
-Document.prototype.getElementById=function(id){return _origGEBI.call(this,idAliases[id]||id);};
-window.q=document.getElementById('question');window.c=document.getElementById('code');window.t=document.getElementById('tests');window.go=document.getElementById('run-interactive');window.r=document.getElementById('interactive-results');
-
 const interactiveResults=document.querySelector('#interactive-results'),interactiveGo=document.querySelector('#run-interactive');
 const escapeHtml=value=>String(value??'').replace(/[&<>]/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[char]));
 const errorMessage=detail=>Array.isArray(detail)?detail.map(item=>item?.msg||String(item)).join('; '):(typeof detail==='string'?detail:'Request failed.');
