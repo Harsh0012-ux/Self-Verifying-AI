@@ -1,0 +1,16 @@
+.env
+.env.*
+!.env.example
+.venv/
+.vscode/
+.cache/
+.pip-tmp/
+.test-*/
+.test-pytest/
+.test-temp/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.egg-info/
+evaluation_results/
+Download Mentor_Interaction_Briefing CLAUDE.pdf
