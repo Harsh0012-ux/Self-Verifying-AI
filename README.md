@@ -17,6 +17,8 @@ Evaluated against a direct, unverified baseline on the HumanEval code-generation
 
 *Full methodology and discussion in [Results](#results).*
 
+> **Picking up this project?** [`docs/PROJECT_HANDOFF.md`](docs/PROJECT_HANDOFF.md) has an exhaustive, code-verified technical handoff — architecture, module walkthrough, database schema, security model, known-bug history, limitations, and a prioritized roadmap.
+
 ---
 
 ## Table of Contents
@@ -112,7 +114,7 @@ Three-page app (Home / Interactive / HumanEval Demo) with a shared theme toggle 
 
 | Layer | Technology |
 |---|---|
-| Language | Python 3.14 |
+| Language | Python 3.11+ |
 | API | FastAPI + Uvicorn |
 | LLM Access | OpenAI SDK (OpenAI-compatible — tested against Groq) |
 | Sandbox | Docker (isolated execution container) |
