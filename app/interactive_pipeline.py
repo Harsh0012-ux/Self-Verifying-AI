@@ -100,13 +100,24 @@ class InteractivePipeline:
         )
 
     def run(self, question: str, *, code: str | None = None,
-            tests: list[str] | None = None) -> InteractiveRun:
+            tests: list[str] | None = None,
+            session_id: int | None = None) -> InteractiveRun:
+        """Run one interactive session.
+
+        When ``session_id`` is provided (async /sessions workflow) the method
+        updates the pre-created VerificationSession.  When None (legacy
+        /interactive/run endpoint) behaviour is identical to before.
+        """
         if self.verification_candidates < 1:
             raise ValueError("verification_candidates must be at least 1")
         if self.max_repair_attempts < 0:
             raise ValueError("max_repair_attempts cannot be negative")
         if tests is not None and (not tests or any(not test.strip() for test in tests)):
             raise ValueError("tests must be a non-empty list of non-empty Python assertions")
+
+        # --- All LLM generation happens before we open the DB session ---
+        # This mirrors the original design and keeps the DB session short
+        # for the generation phase (which does no DB work).
 
         first_generation = self.llm.generate(self._generation_prompt(question, code))
         first_candidate_code = extract_python_code(first_generation.code)
@@ -126,6 +137,7 @@ class InteractivePipeline:
                 question, code, canonical_function_name))
             generations.append(generation)
             candidate_codes.append(extract_python_code(generation.code))
+
         if tests is None:
             proposals = [self.llm.generate(self._test_prompt(
                 question, candidate, canonical_function_name)).code
@@ -141,30 +153,61 @@ class InteractivePipeline:
             oracle_kind = "user_supplied"
 
         with self.session_factory() as db:
-            verification = VerificationSession(
-                task_id="interactive", source="interactive", question=question,
-                oracle_kind=oracle_kind, oracle_tests=oracle_tests,
-                status=VerificationStatus.running,
-            )
-            db.add(verification)
-            db.flush()
+            if session_id is not None:
+                # Async path: update the pre-created session with oracle metadata.
+                verification = db.get(VerificationSession, session_id)
+                if verification is None:
+                    raise RuntimeError(f"Pre-created session {session_id} not found in database")
+                verification.status = VerificationStatus.running
+                verification.oracle_kind = oracle_kind
+                verification.oracle_tests = oracle_tests
+                verification.current_stage = "initializing"
+                db.commit()
+            else:
+                # Legacy synchronous path: create the session here as before.
+                verification = VerificationSession(
+                    task_id="interactive", source="interactive", question=question,
+                    oracle_kind=oracle_kind, oracle_tests=oracle_tests,
+                    mode="interactive",
+                    status=VerificationStatus.running,
+                    current_stage="initializing",
+                )
+                db.add(verification)
+                db.flush()
+
+            def _stage(stage: str) -> None:
+                verification.current_stage = stage
+                db.commit()
 
             candidates: list[Attempt] = []
             candidate_evidences: list[SandboxEvidence] = []
+
+            _stage("running_visible_tests")
             for index, (generation, candidate_code) in enumerate(zip(generations, candidate_codes)):
                 evidence = self.sandbox.run(candidate_code, oracle_tests)
                 attempt = Attempt(session_id=verification.id, phase=AttemptPhase.candidate,
                     attempt_index=index, candidate_code=candidate_code, token_usage=generation.token_usage)
                 VerifiedPipeline._attempt_from_evidence(attempt, evidence, visible=True)
                 db.add(attempt)
+                # Commit each candidate individually for progress visibility.
+                db.commit()
                 candidates.append(attempt)
                 candidate_evidences.append(evidence)
 
+            _stage("selecting_candidate")
             selected_index = select_best_candidate(candidate_evidences)
             selected = candidates[selected_index]
             selected.is_selected = True
+
+            # For interactive mode the "hidden" test is the same oracle run a
+            # second time against the selected candidate — there is no stronger
+            # independent test.  This is intentional and is explicitly labeled
+            # via oracle_kind so callers understand the evidence is not
+            # ground-truth verification.
+            _stage("running_hidden_tests")
             selected_evidence = self.sandbox.run(selected.candidate_code, oracle_tests)
             VerifiedPipeline._attempt_from_evidence(selected, selected_evidence, visible=False)
+            db.commit()
             repair_evidences: list[SandboxEvidence] = []
 
             if selected_evidence.passed:
@@ -172,14 +215,19 @@ class InteractivePipeline:
             else:
                 last_code, last_evidence = selected.candidate_code, selected_evidence
                 for repair_index in range(self.max_repair_attempts):
+                    _stage("repairing")
                     generation = self.llm.generate(self._repair_prompt(question, last_code, last_evidence))
                     repaired_code = extract_python_code(generation.code)
+
+                    _stage("running_hidden_tests")
                     repair_evidence = self.sandbox.run(repaired_code, oracle_tests)
                     repair = Attempt(session_id=verification.id, phase=AttemptPhase.repair,
                         attempt_index=repair_index, candidate_code=repaired_code,
                         token_usage=generation.token_usage)
                     VerifiedPipeline._attempt_from_evidence(repair, repair_evidence, visible=False)
                     db.add(repair)
+                    # Commit each repair individually for progress visibility.
+                    db.commit()
                     repair_evidences.append(repair_evidence)
                     if repair_evidence.passed:
                         verification.status = VerificationStatus.succeeded
@@ -188,6 +236,8 @@ class InteractivePipeline:
                 else:
                     verification.status = VerificationStatus.exhausted
 
+            _stage("completing")
+            verification.current_stage = None
             verification.completed_at = datetime.now(UTC)
             db.commit()
             db.refresh(verification)

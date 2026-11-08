@@ -136,8 +136,14 @@ class VerifiedPipeline:
         attempt.duration_ms = evidence.duration_ms
 
     def run(self, task_id: str, *, trial_index: int = 0,
-            eval_hidden_candidates: bool = False) -> VerificationSession:
-        """Run one session.
+            eval_hidden_candidates: bool = False,
+            session_id: int | None = None) -> VerificationSession:
+        """Run one verified session.
+
+        When ``session_id`` is provided (async /sessions workflow) the method
+        updates the pre-created VerificationSession instead of creating a new
+        one.  When None (legacy /verified/run endpoint) behaviour is identical
+        to before this change.
 
         ``eval_hidden_candidates`` is measurement-only instrumentation.  It
         runs hidden tests for non-selected generated candidates after the
@@ -154,16 +160,38 @@ class VerifiedPipeline:
             raise RuntimeError(f"Task {task_id} has no executable visible tests")
 
         with self.session_factory() as db:
-            verification = VerificationSession(task_id=task_id, trial_index=trial_index,
-                status=VerificationStatus.running)
-            db.add(verification)
-            db.flush()
+            if session_id is not None:
+                # Async path: fetch the pre-created session and move it to running.
+                verification = db.get(VerificationSession, session_id)
+                if verification is None:
+                    raise RuntimeError(f"Pre-created session {session_id} not found in database")
+                verification.status = VerificationStatus.running
+                verification.current_stage = "initializing"
+                db.commit()
+            else:
+                # Legacy synchronous path: create the session here as before.
+                verification = VerificationSession(
+                    task_id=task_id, trial_index=trial_index,
+                    mode="verified", source="humaneval",
+                    status=VerificationStatus.running,
+                    current_stage="initializing",
+                )
+                db.add(verification)
+                db.flush()
+
+            def _stage(stage: str) -> None:
+                verification.current_stage = stage
+                db.commit()
 
             candidates: list[Attempt] = []
             candidate_evidences: list[SandboxEvidence] = []
+
+            _stage("generating_candidates")
             for index in range(self.verification_candidates):
                 generation = self.llm.generate(self._generation_prompt(task))
                 code = extract_python_code(generation.code)
+
+                _stage("running_visible_tests")
                 evidence = self.sandbox.run(code, tests)
                 attempt = Attempt(
                     session_id=verification.id, phase=AttemptPhase.candidate, attempt_index=index,
@@ -171,22 +199,31 @@ class VerifiedPipeline:
                 )
                 self._attempt_from_evidence(attempt, evidence, visible=True)
                 db.add(attempt)
+                # Commit each candidate individually so progress is visible to polling clients.
+                db.commit()
                 candidates.append(attempt)
                 candidate_evidences.append(evidence)
 
+            _stage("selecting_candidate")
             selected_index = select_best_candidate(candidate_evidences)
             selected = candidates[selected_index]
             selected.is_selected = True
+
+            _stage("running_hidden_tests")
             hidden_evidence = self.sandbox.run(selected.candidate_code, [task.hidden_test])
             self._attempt_from_evidence(selected, hidden_evidence, visible=False)
+            db.commit()
 
             if hidden_evidence.passed:
                 verification.status = VerificationStatus.succeeded
             else:
                 last_code, last_evidence = selected.candidate_code, hidden_evidence
                 for repair_index in range(self.max_repair_attempts):
+                    _stage("repairing")
                     generation = self.llm.generate(self._repair_prompt(task, last_code, last_evidence))
                     repaired_code = extract_python_code(generation.code)
+
+                    _stage("running_hidden_tests")
                     repair_evidence = self.sandbox.run(repaired_code, [task.hidden_test])
                     repair = Attempt(
                         session_id=verification.id, phase=AttemptPhase.repair, attempt_index=repair_index,
@@ -194,6 +231,8 @@ class VerifiedPipeline:
                     )
                     self._attempt_from_evidence(repair, repair_evidence, visible=False)
                     db.add(repair)
+                    # Commit each repair individually for progress visibility.
+                    db.commit()
                     if repair_evidence.passed:
                         verification.status = VerificationStatus.succeeded
                         break
@@ -213,6 +252,8 @@ class VerifiedPipeline:
                     )
                     self._attempt_from_evidence(candidate, candidate_hidden_evidence, visible=False)
 
+            _stage("completing")
+            verification.current_stage = None
             verification.completed_at = datetime.now(UTC)
             db.commit()
             db.refresh(verification)
