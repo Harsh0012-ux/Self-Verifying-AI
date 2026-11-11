@@ -1,298 +1,386 @@
-# Experimental Self-Verifying AI
+# Experimental Self-Verifying AI (SVA)
 
-**Can an AI agent test its own work before trusting it — and repair itself when it's wrong?**
+**Run it before you trust it.**
 
-An MCA research prototype that inserts an experimental verification layer between AI decision generation and execution. Instead of trusting a single LLM-generated answer, the system generates multiple candidates, tests them in an isolated sandbox, selects the best-supported one using real evidence, and — if it still fails — diagnoses and repairs it, all within a bounded budget.
+SVA is an MCA major-project research prototype that explores an evidence-driven AI coding workflow. Instead of accepting a single LLM-generated answer, it generates several candidate solutions, executes each one in an isolated Docker sandbox, compares what actually happened, selects a candidate, and runs a final check before accepting it. If the final check fails, a bounded repair step is attempted.
 
-Evaluated against a direct, unverified baseline on the HumanEval code-generation benchmark:
+The goal is to make AI-generated solutions more reliable and more traceable through observed execution evidence rather than model self-assessment.
 
-| Metric | Baseline | Verified |
-|---|---|---|
-| Task Success Rate | 92% | **100%** |
-| Verification Accuracy | — | **99.56%** |
-| False Positive Rate | — | 0.51% |
-| False Negative Rate | — | 0% |
-| Avg. Tokens / Trial | 476 | 1,444 |
-| Avg. Duration / Trial | 617 ms | 1,753 ms |
-
-*Full methodology and discussion in [Results](#results).*
-
-> **Picking up this project?** [`docs/PROJECT_HANDOFF.md`](docs/PROJECT_HANDOFF.md) has an exhaustive, code-verified technical handoff — architecture, module walkthrough, database schema, security model, known-bug history, limitations, and a prioritized roadmap.
-
----
+> **Important:** passing tests is evidence, not proof. Tests you supply are only as good as the cases you wrote. Tests the model generates for itself are consistency checks, not ground truth. See [How verification is labelled](#how-verification-is-labelled).
 
 ## Table of Contents
 
-- [Why This Exists](#why-this-exists)
+- [Overview and status](#overview-and-status)
 - [Screenshots](#screenshots)
+- [How SVA works](#how-sva-works)
+- [How verification is labelled](#how-verification-is-labelled)
 - [Architecture](#architecture)
-- [Features](#features)
-- [Tech Stack](#tech-stack)
-- [Project Structure](#project-structure)
-- [Getting Started](#getting-started)
-- [API Reference](#api-reference)
-- [Running the Evaluation](#running-the-evaluation)
-- [Results](#results)
+- [Verification modes](#verification-modes)
+- [Technology stack](#technology-stack)
+- [Repository structure](#repository-structure)
+- [Backend setup (Windows PowerShell)](#backend-setup-windows-powershell)
+- [Android setup (Windows PowerShell)](#android-setup-windows-powershell)
+- [API overview](#api-overview)
+- [Example workflow](#example-workflow)
 - [Testing](#testing)
-- [Security & Integrity](#security--integrity)
+- [Evaluation (author-reported)](#evaluation-author-reported)
 - [Limitations](#limitations)
-- [Future Work](#future-work)
-- [Acknowledgments](#acknowledgments)
+- [Future improvements](#future-improvements)
+- [Contributors](#contributors)
+- [References](#references)
 
----
+## Overview and status
 
-## Why This Exists
-
-Current LLM-based agents generate a decision and execute it directly — there's no checkpoint between "the model thinks this is right" and it actually running. Prior approaches to improving reliability (**ReAct**, **Self-Refine**, **Reflexion**, **Chain-of-Verification**) all improve an answer through the model reconsidering it *in text* — reflecting, critiquing, asking itself questions — without ever executing a candidate to see what actually happens.
-
-This project's claim: verification should be **experimental**, not textual. Generate multiple candidates, run them, and let observed evidence — not the model's self-assessment — decide what gets trusted.
+| Component | Status |
+|---|---|
+| FastAPI backend: baseline, verified (HumanEval) and interactive pipelines | Implemented on `main` |
+| Docker sandbox executor with network, filesystem and resource restrictions | Implemented on `main` |
+| PostgreSQL persistence of sessions and attempts (Alembic migrations 0001–0004) | Implemented on `main` |
+| Built-in web UI (`/`, `/interactive`, `/humaneval`) | Implemented on `main` |
+| Evaluation scripts (`scripts/run_evaluation.py`, `scripts/compute_metrics.py`) | Implemented on `main` |
+| Async session workflow: `POST /sessions`, `GET /sessions`, `GET /sessions/{id}`, stage tracking, bounded worker pool | In open pull request [#1](https://github.com/Harsh0012-ux/Self-Verifying-AI/pull/1); not merged |
+| Android client (Kotlin / Jetpack Compose, `android/`) | In open pull request [#2](https://github.com/Harsh0012-ux/Self-Verifying-AI/pull/2); not merged |
+| Confidence-weighted candidate selection | Planned (selection currently uses raw visible-test pass count) |
+| Competing-hypothesis failure diagnosis | Planned (repair is currently a single feedback-and-retry step) |
+| Domains other than code generation | Planned |
 
 ## Screenshots
 
-> Capture these pages (light and dark mode) from your running instance and save them into `docs/screenshots/` using the filenames below — they'll render automatically once added.
+The three screenshot files referenced below are not present in this checkout yet. Add the actual JPG captures at these paths to display them; no screenshots have been generated or substituted.
 
-| Page | Screenshot |
+<table>
+  <tr>
+    <td align="center" width="33%">
+      <img src="docs/screenshots/home.jpg" alt="SVA home screen with verification modes and recent sessions" width="260"><br>
+      <sub><b>Home</b>: the Generate, Sandbox, Select and Hidden check stages, the three verification modes (Interactive, HumanEval verified, Baseline) and recent sessions with their outcomes.</sub>
+    </td>
+    <td align="center" width="33%">
+      <img src="docs/screenshots/results.jpg" alt="Results screen for a session verified against user-supplied tests" width="260"><br>
+      <sub><b>Results</b>: a completed session (Passed) labelled "User-supplied", showing the selected code, 8/8 selected-candidate tests, hidden-test status, tokens and duration.</sub>
+    </td>
+    <td align="center" width="33%">
+      <img src="docs/screenshots/test-evidence.jpg" alt="Selected candidate code and evidence summary from a completed session" width="260"><br>
+      <sub><b>Evidence</b>: the selected candidate's code and its evidence summary from a completed session (8/8 selected-candidate tests, hidden tests Passed). This view does not list the individual tests.</sub>
+    </td>
+  </tr>
+</table>
+
+## How SVA works
+
+1. **Submit.** The user submits a coding question, optionally with their own test assertions (interactive mode), or picks a HumanEval task.
+2. **Generate.** The backend asks the LLM for several candidate solutions (default 3, set by `VERIFICATION_CANDIDATES`).
+3. **Execute.** Each candidate runs in its own Docker sandbox against the available tests.
+4. **Collect evidence.** Per-test pass/fail, stdout, stderr, timing and token usage are recorded.
+5. **Select.** The candidate with the highest observed test pass count is selected. Ties go to the first-generated candidate.
+6. **Final check.** The selected candidate is executed once more against the final oracle (see the table below for what that means in each mode).
+7. **Repair (only if the final check fails).** The model is asked for a corrected version, up to `MAX_REPAIR_ATTEMPTS` times (default 2). The repair prompt contains only a redacted summary of the failure (failure count, built-in exception type names, timeout or exit status), never raw test source, stdout or stderr.
+8. **Record.** Sessions, candidates, repair attempts and their evidence are persisted to PostgreSQL.
+
+If the budget is exhausted without a passing result, the session ends as `exhausted`.
+
+## How verification is labelled
+
+| Term | Meaning in SVA |
 |---|---|
-| Home | ![Home](docs/screenshots/home-dark.png) |
-| Interactive Verification Studio | ![Interactive](docs/screenshots/interactive-results-dark.png) |
-| HumanEval Benchmark Demo | ![HumanEval Demo](docs/screenshots/humaneval-results-dark.png) |
-| Candidate loading state | ![Loading](docs/screenshots/interactive-loading-skeleton.png) |
+| **User-supplied tests** | Assertions the user provides. The strongest evidence available in interactive mode, but only as complete as the user's cases. |
+| **Self-generated consistency tests** | Assertions proposed by the LLM for each candidate and pooled across candidates. They check candidates against each other. They are **not** ground truth, and the session is labelled `self_generated`. |
+| **Visible pre-check** | In HumanEval mode, assertions derived from the examples in the task's docstring. Cheap, used to rank candidates. |
+| **Hidden / final check** | In HumanEval mode, the benchmark's canonical test, which the model never sees. In interactive mode there is no separate hidden test: the same oracle (your tests, or the pooled self-generated tests) is run again on the selected candidate, so it is a re-run, not an independent second opinion. |
+| **Candidate selection** | Choosing among generated candidates using their pre-final-check pass count. |
+| **Final verification** | The final check on the selected candidate, followed by the bounded repair step on failure. |
+
+The Android app labels the last stage "Hidden check" on the home screen and "Final check" on the live verification screen; both refer to the final check above.
 
 ## Architecture
 
-Two loops around a real execution step: verify *before* committing, diagnose and repair *after* a failure.
-
 ```mermaid
 flowchart TD
-    A[Coding Task] --> B{Pipeline Mode}
+    subgraph Clients
+        ANDROID["Android app<br/>Kotlin / Jetpack Compose<br/>(PR #2)"]
+        WEB["Built-in web UI<br/>/ , /interactive , /humaneval"]
+    end
 
-    B -->|Baseline| C[Generate 1 Candidate]
-    C --> D[Execute vs Hidden Test]
-    D --> E[(PostgreSQL<br/>Evidence Store)]
+    subgraph Backend["FastAPI backend (app/)"]
+        API["HTTP routes<br/>app/main.py"]
+        SESS["Async session workflow<br/>POST/GET /sessions<br/>(PR #1)"]
+        BASE["Baseline pipeline<br/>1 candidate, no verification"]
+        VER["Verified pipeline<br/>HumanEval tasks"]
+        INTER["Interactive pipeline<br/>free-form questions"]
+        LLM["LLM client<br/>OpenAI-compatible API"]
+        SEL["Candidate selection<br/>highest pass count"]
+        REPAIR["Bounded repair<br/>redacted failure summary"]
+    end
 
-    B -->|Verified| F[Generate N Candidates]
-    F --> G[Test Each vs Visible Examples<br/>in Docker Sandbox]
-    G --> H[Select Best-Supported Candidate]
-    H --> I[Execute vs Hidden Test]
-    I -->|Pass| E
-    I -->|Fail| J["Build Repair Prompt<br/>(test source redacted)"]
-    J --> K[LLM Generates Repair]
-    K --> I
-    I -.->|Max attempts reached| L[Exhausted]
-    L --> E
+    SANDBOX["Docker sandbox<br/>docker/runner.py<br/>no network, read-only FS, limits"]
+    DB[("PostgreSQL<br/>sessions, attempts, evidence")]
+    PROVIDER[["LLM provider<br/>e.g. Groq or OpenAI"]]
+
+    WEB --> API
+    ANDROID -. "endpoints used: not verified" .-> SESS
+    API --> BASE
+    API --> VER
+    API --> INTER
+    SESS --> VER
+    SESS --> INTER
+    SESS --> BASE
+
+    VER --> LLM
+    INTER --> LLM
+    BASE --> LLM
+    LLM <--> PROVIDER
+
+    VER --> SANDBOX
+    INTER --> SANDBOX
+    BASE --> SANDBOX
+    SANDBOX --> SEL
+    SEL --> SANDBOX
+    SANDBOX -->|"final check fails"| REPAIR
+    REPAIR --> LLM
+
+    VER --> DB
+    INTER --> DB
+    BASE --> DB
 ```
 
-Every execution — candidate or repair — runs through the same hardened sandbox:
+| Component | Role |
+|---|---|
+| **Android app** | Mobile client showing modes, stage progress, results and history. Source is in open PR #2. Which backend endpoints it calls has not been verified for this README. |
+| **Built-in web UI** | Three server-rendered pages in `app/main.py` using vanilla HTML/CSS/JS. |
+| **FastAPI backend** | Routes requests to the three pipelines and exposes JSON endpoints. |
+| **Pipelines** | Baseline (`app/pipeline.py`), verified (`app/verified_pipeline.py`), interactive (`app/interactive_pipeline.py`). Interactive reuses selection and repair-redaction logic from the verified pipeline. |
+| **LLM client** | `app/llm.py` wraps the OpenAI Python SDK and accepts a custom `base_url`, so any OpenAI-compatible provider works. |
+| **Docker sandbox** | `app/sandbox.py` launches `docker/runner.py` in a container with no network, read-only filesystem, non-root user, dropped capabilities, and process, memory, CPU and time limits. |
+| **Candidate selection** | Picks the highest pass count; no confidence weighting is implemented. |
+| **Repair** | Single feedback-and-retry loop with an allow-listed failure summary. |
+| **PostgreSQL** | Stores sessions and every candidate and repair attempt with its evidence. Schema managed by Alembic. |
 
-```mermaid
-flowchart LR
-    Candidate[Untrusted Candidate Code] --> Sandbox["Docker Sandbox<br/>no network · non-root · read-only FS<br/>CPU / memory / PID / time limits"]
-    Sandbox --> Evidence[Structured Evidence<br/>stdout · stderr · pass/fail · timing]
-```
+Components labelled PR #1 and PR #2 are not on `main` yet.
 
-## Features
+## Verification modes
 
-**Baseline Pipeline** — `POST /baseline/run`
-One LLM-generated candidate, executed directly against the hidden test. The unverified comparison point.
+| Mode | Candidates | What it does |
+|---|---|---|
+| **Interactive** | 3 | Any coding question. Uses your tests if provided, otherwise pooled self-generated consistency tests (labelled as weaker evidence). |
+| **HumanEval verified** | 3 | Visible pre-check on docstring examples, then the hidden benchmark test, with up to 2 repair attempts. |
+| **Baseline** | 1 | One candidate, no verification. Kept deliberately unverified as the comparison point for evaluation. |
 
-**Verified Pipeline** — `POST /verified/run`
-Generates 3 candidates, tests each against visible examples, selects the strongest, executes it against the hidden test, and runs a bounded repair loop on failure. Full attempt history persisted.
-
-**Interactive Verification Studio** — `GET /interactive`
-Free-form coding questions, not just HumanEval tasks. Supply your own test assertions for real verification ("Verified against your tests"), or let the system pool self-generated consistency checks across candidates ("Self-verified, no independent ground truth" — honestly labeled as weaker evidence). Automatically detects a canonical function name across candidates so pooled tests don't fail each other for trivial naming mismatches. Always surfaces a best-effort final answer, copy-to-clipboard included, even when full verification fails.
-
-**HumanEval Benchmark Demo** — `GET /humaneval`
-Pick any cached HumanEval task and run it through either pipeline interactively, side by side.
-
-**Evaluation Harness**
-Resumable batch runner across the full task set with provider rate-limit pacing and retry, plus a metrics exporter computing task success rate, verification accuracy (with false positive/negative breakdown), recovery success rate, replanning efficiency, cost overhead, and safety violation rate.
-
-**Dark Mode, Responsive Design**
-Three-page app (Home / Interactive / HumanEval Demo) with a shared theme toggle persisted across navigation, defaulting to system preference, tested at desktop/tablet/mobile breakpoints.
-
-## Tech Stack
+## Technology stack
 
 | Layer | Technology |
 |---|---|
-| Language | Python 3.11+ |
-| API | FastAPI + Uvicorn |
-| LLM Access | OpenAI SDK (OpenAI-compatible — tested against Groq) |
-| Sandbox | Docker (isolated execution container) |
-| Persistence | PostgreSQL + SQLAlchemy + Alembic |
-| Frontend | Vanilla HTML/CSS/JS — no framework, no build step |
-| Testing | pytest |
-| Benchmark | [HumanEval](https://github.com/openai/human-eval) (MIT licensed) |
+| Backend language | Python 3.11 or newer (`requires-python = ">=3.11"` in [`pyproject.toml`](pyproject.toml)) |
+| API | [FastAPI](https://fastapi.tiangolo.com/) (>=0.115) with Uvicorn |
+| LLM access | OpenAI Python SDK (`openai>=1.0`) against an OpenAI-compatible endpoint; the project has been run against Groq with `openai/gpt-oss-120b` |
+| Sandbox | [Docker](https://docs.docker.com/) via the `docker` Python SDK (>=7.1), `python:3.11-alpine` based image |
+| Persistence | PostgreSQL, SQLAlchemy (>=2.0), `psycopg` 3, [Alembic](https://alembic.sqlalchemy.org/) |
+| Configuration | `pydantic-settings`, values read from `.env` |
+| Web UI | Server-rendered HTML with vanilla CSS/JS, no build step |
+| Backend tests | [pytest](https://docs.pytest.org/) and pytest-cov (dev extras) |
+| Benchmark | [HumanEval](https://github.com/openai/human-eval) |
+| Android client | [Kotlin](https://kotlinlang.org/docs/) and [Jetpack Compose](https://developer.android.com/develop/ui/compose); minSdk 26, compileSdk 37, targetSdk 37, Java 11 compatibility, Gradle wrapper 9.8.2 |
 
-## Project Structure
+Kotlin, Compose and Android Gradle Plugin library versions have not been verified for this README.
 
-```
+## Repository structure
+
+```text
 .
-├── app/
-│   ├── main.py                  # FastAPI app: routes, pages, request handling
-│   ├── config.py                # Settings loaded from .env
-│   ├── llm.py                   # LLM client abstraction (OpenAI-compatible)
-│   ├── dataset.py                # HumanEval loader + local cache
-│   ├── code_extraction.py       # Strips markdown fences / prose from LLM output
-│   ├── pipeline.py              # Baseline pipeline
-│   ├── verified_pipeline.py     # Verified pipeline: generate, select, repair
-│   ├── interactive_pipeline.py  # Free-form question pipeline + oracle logic
-│   ├── sandbox.py               # Docker sandbox executor
-│   ├── models.py                # SQLAlchemy models
-│   └── database.py              # Engine + session factory
-├── docker/
-│   ├── sandbox.Dockerfile       # Restricted execution image
-│   └── runner.py                # Runs inside the container; emits structured evidence
-├── alembic/
-│   └── versions/                # 0001 baseline → 0004 interactive sessions
-├── scripts/
-│   ├── validate_baseline.py     # 5-task baseline smoke test
-│   ├── run_evaluation.py        # Full resumable evaluation batch
-│   ├── compute_metrics.py       # Aggregate + per-task metric CSVs
-│   └── diagnose_visible_tests.py
-├── tests/                       # pytest suite (unit + integration-marked)
-├── evaluation_results/          # Generated CSV output
-├── pyproject.toml
+├── app/            # FastAPI app, pipelines, sandbox executor, LLM client, models
+├── docker/         # sandbox.Dockerfile and runner.py (runs inside the container)
+├── alembic/        # database migrations
+├── scripts/        # evaluation, metrics and diagnostic scripts
+├── tests/          # pytest suite
+├── docs/           # PROJECT_HANDOFF.md, screenshots
+├── android/        # Android client (added by open PR #2)
+├── .env.example
 ├── alembic.ini
-└── .env.example
+└── pyproject.toml
 ```
 
-## Getting Started
+- Backend source: [`app/`](https://github.com/Harsh0012-ux/Self-Verifying-AI/tree/main/app)
+- Sandbox: [`docker/`](https://github.com/Harsh0012-ux/Self-Verifying-AI/tree/main/docker)
+- Migrations: [`alembic/`](https://github.com/Harsh0012-ux/Self-Verifying-AI/tree/main/alembic)
+- Scripts: [`scripts/`](https://github.com/Harsh0012-ux/Self-Verifying-AI/tree/main/scripts)
+- Tests: [`tests/`](https://github.com/Harsh0012-ux/Self-Verifying-AI/tree/main/tests)
+- Detailed technical handoff: [`docs/PROJECT_HANDOFF.md`](docs/PROJECT_HANDOFF.md)
+- Android source: `android/` (exists once PR #2 is merged)
 
-**Prerequisites:** Docker Desktop, Python 3.14+, an OpenAI-compatible LLM API key.
+`evaluation_results/` is generated by the evaluation scripts and is gitignored.
+
+## Backend setup (Windows PowerShell)
+
+**Prerequisites:** [Docker Desktop](https://docs.docker.com/desktop/) (running), Python 3.11 or newer, Git, and an API key for an OpenAI-compatible LLM provider.
 
 ```powershell
-# 1. Install dependencies
+# 1. Clone
+git clone https://github.com/Harsh0012-ux/Self-Verifying-AI.git
+cd Self-Verifying-AI
+
+# 2. Virtual environment
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+
+# 3. Install with dev dependencies
 pip install -e ".[dev]"
 
-# 2. Start PostgreSQL
+# 4. Start PostgreSQL (the database name must match DATABASE_URL)
 docker run --name sva-postgres -e POSTGRES_PASSWORD=<password> -e POSTGRES_DB=sva -p 5432:5432 -d postgres:16
 
-# 3. Build the sandbox image
+# 5. Build the sandbox image
 docker build -t sva-sandbox:latest -f docker/sandbox.Dockerfile .
 
-# 4. Configure environment
-copy .env.example .env
-# then edit .env — see table below
+# 6. Configure environment, then edit .env
+Copy-Item .env.example .env
 
-# 5. Apply database migrations
+# 7. Apply migrations
 alembic upgrade head
 
-# 6. Run the app
+# 8. Run the server
 uvicorn app.main:app --reload
 ```
 
-Visit `http://127.0.0.1:8000/` for the home page, or `/docs` for the auto-generated API reference.
+The app is then at `http://127.0.0.1:8000/` and the FastAPI-generated Swagger UI at `http://127.0.0.1:8000/docs`. Replace `<password>` with your own choice and use the same value in `DATABASE_URL`.
 
-**Environment variables (`.env`):**
+### Environment variables
+
+Set these in `.env` (copied from [`.env.example`](.env.example)). Never commit `.env` or paste API keys into issues, chats or commits.
 
 | Variable | Required | Description |
 |---|---|---|
-| `LLM_API_KEY` | Yes | Your LLM provider's API key — never commit this |
-| `LLM_MODEL` | Yes | Model identifier (e.g. `openai/gpt-oss-120b`) |
-| `LLM_BASE_URL` | No | Custom OpenAI-compatible endpoint (e.g. Groq) — omit for OpenAI itself |
+| `LLM_API_KEY` | Yes | API key for your LLM provider |
+| `LLM_MODEL` | Yes | Model identifier, for example `openai/gpt-oss-120b` |
+| `LLM_BASE_URL` | No | Custom OpenAI-compatible endpoint (omit for OpenAI itself) |
 | `DATABASE_URL` | Yes | PostgreSQL connection string |
-| `HUMANEVAL_CACHE_PATH` | No | Local path for the cached dataset (default: `.cache/humaneval.jsonl`) |
-| `VERIFICATION_CANDIDATES` | No | Candidates generated per verified session (default: 3) |
-| `MAX_REPAIR_ATTEMPTS` | No | Bounded repair retries (default: 2) |
+| `HUMANEVAL_CACHE_PATH` | No | Local cache path for the dataset (default `.cache/humaneval.jsonl`) |
+| `VERIFICATION_CANDIDATES` | No | Candidates per verified session (default 3) |
+| `MAX_REPAIR_ATTEMPTS` | No | Maximum repair retries (default 2) |
 
-The first dataset request downloads HumanEval's MIT-licensed JSONL from the upstream repository and caches it locally.
+**Troubleshooting.** If the app or Alembic connects to the wrong database or uses the wrong key, check for stale `DATABASE_URL` or `LLM_API_KEY` values set at the OS level in an already-open terminal, and open a fresh one. A 503 mentioning the sandbox image means step 5 needs to be run.
 
-## API Reference
+## Android setup (Windows PowerShell)
+
+The Android client lives in `android/` (Android Studio project name `NewSelfVerifyingApp`) and is added by open PR #2.
+
+| Setting | Value |
+|---|---|
+| Language / UI | Kotlin, Jetpack Compose |
+| minSdk / compileSdk / targetSdk | 26 / 37 / 37 |
+| Java compatibility | 11 |
+| Gradle wrapper | 9.8.2 |
+
+**Prerequisites:** [Android Studio](https://developer.android.com/studio) with the Android SDK for API 37, a JDK that Gradle 9.8.2 supports, an emulator or physical device (API 26 or newer), and the [backend](#backend-setup-windows-powershell) running.
+
+Build a debug APK (this command completed successfully for the project author):
+
+```powershell
+cd android
+.\gradlew.bat assembleDebug
+```
+
+To run it, open `android/` in Android Studio, let Gradle sync, and run the app on an emulator or device.
+
+**Pointing the app at your backend (unverified).** Where the backend URL is configured in the Android source, and which API endpoints the app calls, have not been verified for this README. Check the Android source in PR #2 before relying on either. General Android networking notes that apply regardless:
+
+- An emulator reaches the host PC at `http://10.0.2.2:<port>`.
+- A physical device needs the backend started with `uvicorn app.main:app --host 0.0.0.0` and your PC's LAN address, on the same network.
+- Android blocks cleartext `http://` traffic by default on recent versions, so a plain-HTTP backend needs a network security configuration in the app.
+
+Documentation: [Android developers](https://developer.android.com/), [Kotlin](https://kotlinlang.org/docs/), [Jetpack Compose](https://developer.android.com/develop/ui/compose).
+
+## API overview
+
+Implemented on `main`. Interactive documentation is served at `/docs` when the app is running.
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/` | Home / landing page |
+| `GET` | `/` | Home page |
 | `GET` | `/interactive` | Interactive Verification Studio |
-| `GET` | `/humaneval` | HumanEval Benchmark Demo |
-| `GET` | `/tasks/humaneval` | List cached HumanEval task IDs |
+| `GET` | `/humaneval` | HumanEval demo page |
+| `GET` | `/tasks/humaneval` | List cached HumanEval task ids |
 | `POST` | `/baseline/run` | Run the baseline pipeline on a HumanEval task |
 | `POST` | `/verified/run` | Run the verified pipeline on a HumanEval task |
-| `POST` | `/interactive/run` | Run the verified pipeline on a free-form question |
+| `POST` | `/interactive/run` | Run the verified pipeline on a free-form question (`question`, optional `code`, optional `tests`) |
 
-**Example — `POST /verified/run`:**
-```json
-{ "task_id": "HumanEval/0" }
-```
-```json
-{
-  "session": { "id": 1, "task_id": "HumanEval/0", "status": "succeeded" },
-  "attempts": [
-    { "phase": "candidate", "attempt_index": 0, "is_selected": true,
-      "passed_visible_tests": true, "passed_hidden_tests": true }
-  ]
-}
-```
+In open PR #1 (not on `main`): `POST /sessions` (returns 202), `GET /sessions`, `GET /sessions/{id}`, for asynchronous sessions with stage tracking. Request and response schemas for these have not been verified for this README.
 
-**Example — `POST /interactive/run`:**
-```json
-{
-  "question": "Write a function that reverses a string.",
-  "tests": ["assert reverse_string(\"abc\") == \"cba\""]
-}
-```
-
-Full request/response schemas: `/docs` (Swagger UI) once the app is running.
-
-## Running the Evaluation
+## Example workflow
 
 ```powershell
-# Small dry run first
-python scripts/run_evaluation.py --task-limit 3 --trials 1
+$body = @{
+  question = "Write a function that reverses a string."
+  tests    = @('assert reverse_string("abc") == "cba"')
+} | ConvertTo-Json
 
-# Full configured evaluation (25 tasks × 3 trials × 2 pipelines = 150 runs)
-python scripts/run_evaluation.py
-
-# Generate metrics
-python scripts/compute_metrics.py
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/interactive/run `
+  -ContentType "application/json" -Body $body
 ```
 
-Output: `evaluation_results/aggregate_metrics.csv` and `per_task_metrics.csv`.
+The response contains the session (status `succeeded` or `exhausted`, `oracle_kind` of `user_supplied` or `self_generated`) and every candidate and repair attempt with its evidence. Omit `tests` to let SVA pool self-generated consistency tests; the session is then labelled as weaker evidence.
 
-## Results
-
-25 HumanEval tasks × 3 independent trials × 2 pipelines (150 total runs, 225 verified candidates):
-
-- **Task success rate** improved from 92% (baseline) to **100%** (verified) — every task baseline ever failed was resolved by candidate selection alone.
-- **Verification accuracy: 99.56%** across all 225 generated candidates — the cheap, pre-execution visible-test check almost never approved a candidate that later failed (0.51% false positives) and never wrongly rejected one that would have passed (0% false negatives).
-- **Cost of verification:** ~3.0× the tokens, ~2.8× the duration of baseline — the measurable price of the reliability gain.
-- **Zero sandbox safety violations** across all 150 runs.
-- The repair/recovery mechanism was implemented and independently unit-tested but was **not triggered by real data** in this evaluation — every selected candidate passed on its first hidden-test attempt. See [Limitations](#limitations).
+The Results screenshot above shows a completed session whose selected code is an `is_prime` function, labelled "User-supplied", with 8/8 selected-candidate tests and the hidden-test status Passed.
 
 ## Testing
 
 ```powershell
-# Fast tests only
+# Fast tests, no external services
 python -m pytest -m "not integration"
 
-# Full suite (requires Docker + PostgreSQL)
+# Full suite (needs Docker, the sva-sandbox image, PostgreSQL and an LLM key)
 python -m pytest
 ```
 
-27 tests across dataset loading, sandbox security (including deliberately hostile candidates — infinite loops, subprocess escape attempts), baseline/verified/interactive pipeline logic, repair-loop bounds, and metric calculations.
+Tests cover dataset loading, sandbox behaviour (including infinite-loop and subprocess-spawn candidates), the three pipelines, repair bounds and metric calculations. Tests marked `integration` require a local Docker daemon and the `sva-sandbox` image.
 
-## Security & Integrity
+## Evaluation (author-reported)
 
-- **Sandbox isolation:** every candidate — baseline, verified, interactive, repair — runs in a Docker container with no network access, a read-only filesystem, a non-root user, dropped Linux capabilities, and CPU/memory/process/time limits. Independently tested against infinite loops and subprocess-escape attempts.
-- **Repair-prompt integrity:** when a candidate fails, the repair prompt is built from an explicit allow-list (failure count, exception type, timeout/process status) — never the raw test source, stdout, or stderr. This guarantees a hidden HumanEval test (or a user-supplied oracle assertion) can never leak back to the model through its own failure message. Verified by inspecting real repair-prompt text sent during a live, deliberately-triggered repair.
-- **Secrets:** API keys are read from environment variables only and are never logged, stored in the database, or committed.
+These figures are **author-reported** and were not independently reproduced for this README.
+
+| Metric | Baseline | Verified |
+|---|---|---|
+| Task success rate | 92% (69/75) | 100% (75/75) |
+| Average tokens per trial | 476 | 1,444 (about 3.0×) |
+| Average duration per trial | 617 ms | 1,753 ms (about 2.8×) |
+
+Setup: 25 HumanEval tasks × 3 trials × 2 pipelines (150 runs), one model (`openai/gpt-oss-120b` via Groq).
+
+How to read them:
+
+- The 25-task cap is a loader default (`HumanEvalLoader(limit=25)`), not a property of HumanEval, which has 164 tasks.
+- The sample is small and no significance testing or confidence intervals were applied, so the 92% to 100% change is indicative only.
+- The improvement comes from candidate generation and selection. The repair loop never triggered in these runs, so recovery is implemented and unit-tested but **not** empirically validated.
+- Only one model and one domain were tested.
+- Raw results are gitignored, so these numbers cannot be reproduced from the repository alone. Re-run `python scripts/run_evaluation.py` then `python scripts/compute_metrics.py` before citing them.
 
 ## Limitations
 
-- Evaluated on a single domain (HumanEval-style code generation); generalization to other decision domains not tested.
-- Candidate selection uses raw visible-test pass count, not the confidence-weighted formula proposed in the original research design.
-- The implemented repair mechanism is a single feedback-and-retry step rather than the originally envisioned generation and testing of multiple competing failure hypotheses — and was never exercised by real failure data in this evaluation.
-- Evaluation sample (25 tasks × 3 trials) is modest; no formal statistical significance testing performed.
-- Results reflect a single underlying model; not yet tested for generalization across providers.
+- Evaluated only on HumanEval-style code generation, with a small sample, one model, and no statistical significance testing.
+- Passing user-supplied tests shows a candidate satisfies those cases, not that it is correct. Self-generated tests only check consistency.
+- In interactive mode the final check re-runs the same tests; it is not independent.
+- Selection uses raw pass count; ties go to the first-generated candidate.
+- Repair is a single feedback-and-retry step and has not been exercised by real evaluation failures.
+- The Docker sandbox is configured with network disabled, read-only filesystem, non-root user and resource limits, and tested against hostile candidates, but it has not been security-audited and the Docker daemon is assumed trusted.
+- Prompts, including free-form questions and code, are sent to a third-party LLM provider in plain text.
+- No authentication or rate limiting: do not expose the API publicly.
+- The web UI has no automated tests.
+- The Android client, the async session endpoints, and the details listed as unverified above are not yet on `main`.
 
-## Future Work
+## Future improvements
 
-- Evaluate on a larger, harder task subset specifically chosen to exercise the repair path.
-- Extend diagnosis to genuine competing-hypothesis generation and testing.
-- Empirically tune the confidence-scoring formula instead of raw pass count.
-- Test generalization across multiple LLMs and a second task domain.
-- pass@k-style statistical treatment with confidence intervals.
+- Evaluate on the full HumanEval set and on tasks chosen to exercise the repair path.
+- Confidence-weighted candidate selection.
+- Competing-hypothesis failure diagnosis.
+- Cross-model and cross-domain evaluation, with confidence intervals.
+- Authentication, rate limiting and CI for the backend.
 
-## Acknowledgments
+## Contributors
 
-- [HumanEval](https://github.com/openai/human-eval) (Chen et al., 2021, OpenAI) — MIT licensed benchmark dataset.
-- MCA (AI & DS) Major Project, K.R. Mangalam University, School of Engineering & Technology.
+- Harsh ([@Harsh0012-ux](https://github.com/Harsh0012-ux)): sole developer. MCA (AI & DS) major project, K.R. Mangalam University.
+
+## References
+
+- [HumanEval benchmark](https://github.com/openai/human-eval) (Chen et al., 2021)
+- [Docker documentation](https://docs.docker.com/)
+- [Android developer documentation](https://developer.android.com/)
+- [Kotlin documentation](https://kotlinlang.org/docs/)
+- [Jetpack Compose documentation](https://developer.android.com/develop/ui/compose)
+- [FastAPI](https://fastapi.tiangolo.com/), [SQLAlchemy](https://docs.sqlalchemy.org/), [Alembic](https://alembic.sqlalchemy.org/), [pytest](https://docs.pytest.org/)
