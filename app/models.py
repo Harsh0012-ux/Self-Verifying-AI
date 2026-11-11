@@ -6,7 +6,16 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 class Base(DeclarativeBase): pass
 class RunMode(str, enum.Enum): baseline = "baseline"; verified = "verified"
-class VerificationStatus(str, enum.Enum): running = "running"; succeeded = "succeeded"; exhausted = "exhausted"
+
+
+class VerificationStatus(str, enum.Enum):
+    pending   = "pending"    # created, pipeline thread not yet started
+    running   = "running"    # pipeline thread is executing
+    succeeded = "succeeded"  # at least one candidate or repair passed all tests
+    exhausted = "exhausted"  # all candidates and repairs failed
+    failed    = "failed"     # unhandled exception during pipeline execution
+
+
 class AttemptPhase(str, enum.Enum): candidate = "candidate"; repair = "repair"
 
 
@@ -23,6 +32,13 @@ class Run(Base):
     duration_ms: Mapped[float] = mapped_column()
     token_usage: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(UTC))
+    # Nullable FK linking a baseline run to its parent async session.
+    # Null for runs created by the legacy synchronous /baseline/run endpoint.
+    session_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("verification_sessions.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     test_results: Mapped[list["TestResult"]] = relationship(cascade="all, delete-orphan")
 
 
@@ -44,11 +60,17 @@ class VerificationSession(Base):
     # Kept as a string instead of an enum so new interactive rows remain
     # clearly separable without changing the established HumanEval enum types.
     source: Mapped[str] = mapped_column(String(20), default="humaneval", nullable=False, index=True)
+    # mode: baseline | verified | interactive — required for async /sessions API
+    mode: Mapped[str] = mapped_column(String(12), nullable=False, default="verified")
     question: Mapped[str | None] = mapped_column(Text, nullable=True)
     oracle_kind: Mapped[str | None] = mapped_column(String(30), nullable=True)
     oracle_tests: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
     trial_index: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     status: Mapped[VerificationStatus] = mapped_column(Enum(VerificationStatus), nullable=False)
+    # Human-readable pipeline stage for progress tracking (e.g. "generating_candidates")
+    current_stage: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    # Populated when status == failed; sanitised exception type + message only
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(UTC))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     attempts: Mapped[list["Attempt"]] = relationship(

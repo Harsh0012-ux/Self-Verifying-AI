@@ -1,18 +1,88 @@
-from fastapi import FastAPI, HTTPException
+import enum
+import json as _json
+import logging
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime
+
+from threading import BoundedSemaphore
+
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from app.config import settings
 from app.database import SessionLocal
 from app.dataset import HumanEvalLoader
 from app.interactive_pipeline import InteractivePipeline
 from app.llm import OpenAIClient
+from app.models import (
+    Run, VerificationSession, VerificationStatus,
+)
 from app.pipeline import BaselinePipeline
 from app.sandbox import SandboxExecutor
 from app.verified_pipeline import VerifiedPipeline
 
-app = FastAPI(title="Experimental Self-Verifying AI")
+logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Bounded executor — max_workers=5 as specified.
+# Created at module level so it is shared across all requests and shut down
+# cleanly by the lifespan handler.
+# ---------------------------------------------------------------------------
+_MAX_WORKERS = 5
+_MAX_QUEUED = 5
+
+_executor = ThreadPoolExecutor(max_workers=_MAX_WORKERS)
+_submission_slots = BoundedSemaphore(_MAX_WORKERS + _MAX_QUEUED)
+
+
+def _get_session_local():
+    """Return the current SessionLocal, resolved at call time so test patches apply.
+
+    Reading through the module's own __dict__ means that
+    ``patch.object(app.main, 'SessionLocal', mock_factory)`` in tests
+    is transparently honoured here without an extra patch target.
+    """
+    import app.main as _self
+    return _self.SessionLocal
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Mark orphaned sessions (pending/running at startup) as failed."""
+    with _get_session_local()() as db:
+        orphans = (
+            db.query(VerificationSession)
+            .filter(
+                VerificationSession.status.in_(
+                    [VerificationStatus.pending, VerificationStatus.running]
+                )
+            )
+            .all()
+        )
+        for s in orphans:
+            s.status = VerificationStatus.failed
+            s.current_stage = None
+            s.error_message = (
+                "Server restarted while this session was in progress; "
+                "execution did not complete."
+            )
+            s.completed_at = datetime.now(UTC)
+        if orphans:
+            db.commit()
+            logger.warning("Marked %d orphaned session(s) as failed on startup.", len(orphans))
+    yield
+    # Graceful shutdown: wait for in-flight pipeline threads to finish.
+    _executor.shutdown(wait=True)
+
+
+app = FastAPI(title="Experimental Self-Verifying AI", lifespan=lifespan)
+
+
+# ---------------------------------------------------------------------------
+# Shared request / response helpers
+# ---------------------------------------------------------------------------
 
 class BaselineRequest(BaseModel):
     task_id: str
@@ -25,20 +95,38 @@ class InteractiveRequest(BaseModel):
 
 
 def _attempt_payload(attempt):
-    return {"id": attempt.id, "phase": attempt.phase.value, "attempt_index": attempt.attempt_index,
-            "candidate_code": attempt.candidate_code, "passed_visible_tests": attempt.passed_visible_tests,
-            "passed_hidden_tests": attempt.passed_hidden_tests, "is_selected": attempt.is_selected,
-            "stdout": attempt.stdout, "stderr": attempt.stderr, "error_summary": attempt.error_summary,
-            "token_usage": attempt.token_usage, "duration_ms": attempt.duration_ms,
-            "created_at": attempt.created_at}
+    return {
+        "id": attempt.id,
+        "phase": attempt.phase.value,
+        "attempt_index": attempt.attempt_index,
+        "candidate_code": attempt.candidate_code,
+        "passed_visible_tests": attempt.passed_visible_tests,
+        "passed_hidden_tests": attempt.passed_hidden_tests,
+        "is_selected": attempt.is_selected,
+        "stdout": attempt.stdout,
+        "stderr": attempt.stderr,
+        "error_summary": attempt.error_summary,
+        "token_usage": attempt.token_usage,
+        "duration_ms": attempt.duration_ms,
+        "created_at": attempt.created_at,
+    }
 
+
+# ---------------------------------------------------------------------------
+# Existing synchronous endpoints — UNCHANGED, fully backward-compatible
+# ---------------------------------------------------------------------------
 
 @app.post("/baseline/run")
 def baseline_run(request: BaselineRequest):
     try:
-        run = BaselinePipeline(OpenAIClient(), SandboxExecutor(), SessionLocal, HumanEvalLoader()).run(request.task_id)
-        return {"run_id": run.id, "task_id": run.task_id, "hidden_passed": run.hidden_passed,
-                "duration_ms": run.duration_ms, "token_usage": run.token_usage}
+        run = BaselinePipeline(
+            OpenAIClient(), SandboxExecutor(), SessionLocal, HumanEvalLoader()
+        ).run(request.task_id)
+        return {
+            "run_id": run.id, "task_id": run.task_id,
+            "hidden_passed": run.hidden_passed,
+            "duration_ms": run.duration_ms, "token_usage": run.token_usage,
+        }
     except KeyError:
         raise HTTPException(404, "Unknown task id")
     except RuntimeError as exc:
@@ -48,10 +136,18 @@ def baseline_run(request: BaselineRequest):
 @app.post("/verified/run")
 def verified_run(request: BaselineRequest):
     try:
-        session = VerifiedPipeline(OpenAIClient(), SandboxExecutor(), SessionLocal, HumanEvalLoader()).run(request.task_id)
-        return {"session": {"id": session.id, "task_id": session.task_id, "status": session.status.value,
-                            "created_at": session.created_at, "completed_at": session.completed_at},
-                "attempts": [_attempt_payload(attempt) for attempt in session.attempts]}
+        session = VerifiedPipeline(
+            OpenAIClient(), SandboxExecutor(), SessionLocal, HumanEvalLoader()
+        ).run(request.task_id)
+        return {
+            "session": {
+                "id": session.id, "task_id": session.task_id,
+                "status": session.status.value,
+                "created_at": session.created_at,
+                "completed_at": session.completed_at,
+            },
+            "attempts": [_attempt_payload(a) for a in session.attempts],
+        }
     except KeyError:
         raise HTTPException(404, "Unknown task id")
     except (RuntimeError, ValueError) as exc:
@@ -75,25 +171,388 @@ def _evidence_payload(evidence):
 @app.post("/interactive/run")
 def interactive_run(request: InteractiveRequest):
     try:
-        result = InteractivePipeline(OpenAIClient(), SandboxExecutor(), SessionLocal,
-            settings.verification_candidates, settings.max_repair_attempts).run(
-                request.question, code=request.code, tests=request.tests)
+        result = InteractivePipeline(
+            OpenAIClient(), SandboxExecutor(), SessionLocal,
+            settings.verification_candidates, settings.max_repair_attempts,
+        ).run(request.question, code=request.code, tests=request.tests)
         session = result.session
-        return {"session": {"id": session.id, "source": session.source,
+        return {
+            "session": {
+                "id": session.id, "source": session.source,
                 "status": session.status.value, "question": session.question,
-                "oracle_kind": session.oracle_kind, "oracle_tests": result.oracle_tests,
+                "oracle_kind": session.oracle_kind,
+                "oracle_tests": result.oracle_tests,
                 "canonical_function_name": result.canonical_function_name,
                 "canonical_name_note": result.canonical_name_note,
-                "created_at": session.created_at, "completed_at": session.completed_at},
-                "attempts": [_attempt_payload(attempt) for attempt in session.attempts],
-                "candidate_test_results": [_evidence_payload(evidence)
-                    for evidence in result.candidate_evidences],
-                "selected_test_results": _evidence_payload(result.selected_evidence),
-                "repair_test_results": [_evidence_payload(evidence)
-                    for evidence in result.repair_evidences]}
+                "created_at": session.created_at,
+                "completed_at": session.completed_at,
+            },
+            "attempts": [_attempt_payload(a) for a in session.attempts],
+            "candidate_test_results": [
+                _evidence_payload(e) for e in result.candidate_evidences
+            ],
+            "selected_test_results": _evidence_payload(result.selected_evidence),
+            "repair_test_results": [
+                _evidence_payload(e) for e in result.repair_evidences
+            ],
+        }
     except (RuntimeError, ValueError) as exc:
         raise HTTPException(503, str(exc))
 
+
+# ---------------------------------------------------------------------------
+# Async session workflow — new endpoints
+# ---------------------------------------------------------------------------
+
+class _SessionMode(str, enum.Enum):
+    baseline    = "baseline"
+    verified    = "verified"
+    interactive = "interactive"
+
+
+class CreateSessionRequest(BaseModel):
+    mode: _SessionMode
+    # baseline / verified
+    task_id: str | None = None
+    # interactive
+    question: str | None = Field(default=None, min_length=1)
+    code: str | None = None
+    tests: list[str] | None = None
+
+    @model_validator(mode="after")
+    def _check_fields(self) -> "CreateSessionRequest":
+        if self.mode in (_SessionMode.baseline, _SessionMode.verified):
+            if not self.task_id:
+                raise ValueError("task_id is required for baseline and verified modes")
+        if self.mode == _SessionMode.interactive:
+            if not self.question:
+                raise ValueError("question is required for interactive mode")
+        return self
+
+
+def _parse_sandbox_evidence(stdout: str) -> list[dict] | None:
+    """
+    Parse per-test results from the sandbox runner's JSON output line.
+    Returns None when the output cannot be parsed (never raises).
+    Does NOT return attempt.stdout directly — that is an internal format.
+    """
+    if not stdout:
+        return None
+    try:
+        last_line = stdout.strip().splitlines()[-1]
+        data = _json.loads(last_line)
+        raw = data.get("results")
+        if not isinstance(raw, list):
+            return None
+        return [
+            {
+                "name":   item.get("name"),
+                "passed": item.get("passed"),
+                "error":  item.get("error"),
+            }
+            for item in raw
+        ]
+    except Exception:
+        return None
+
+
+def _attempt_detail(attempt) -> dict:
+    """Full attempt payload including parsed evidence for the async /sessions API."""
+    return {
+        "id":                   attempt.id,
+        "phase":                attempt.phase.value,
+        "attempt_index":        attempt.attempt_index,
+        "candidate_code":       attempt.candidate_code,
+        "passed_visible_tests": attempt.passed_visible_tests,
+        "passed_hidden_tests":  attempt.passed_hidden_tests,
+        "is_selected":          attempt.is_selected,
+        "error_summary":        attempt.error_summary,
+        "token_usage":          attempt.token_usage,
+        "duration_ms":          attempt.duration_ms,
+        "created_at":           attempt.created_at,
+        # Parsed per-test evidence; null when unavailable (not invented).
+        "test_evidence":        _parse_sandbox_evidence(attempt.stdout),
+    }
+
+
+def _run_detail(run: Run) -> dict:
+    """Baseline run record for inclusion in a session response."""
+    return {
+        "id":             run.id,
+        "candidate_code": run.candidate_code,
+        "hidden_passed":  run.hidden_passed,
+        "duration_ms":    run.duration_ms,
+        "token_usage":    run.token_usage,
+        "created_at":     run.created_at,
+        "test_results": [
+            {
+                "name":   r.name,
+                "passed": r.passed,
+                "stdout": r.stdout,
+                "stderr": r.stderr,
+                "error":  r.error,
+            }
+            for r in run.test_results
+        ],
+    }
+
+
+def _session_response(session: VerificationSession, run: Run | None = None) -> dict:
+    """Build a consistent response dict for GET /sessions/{id}."""
+    # selected is the attempt flagged is_selected=True, or None
+    selected = next((a for a in session.attempts if a.is_selected), None)
+
+    # For verified/interactive: derive the final answer attempt.
+    # It is the selected candidate if it passed hidden tests, otherwise
+    # the first repair that passed hidden tests (if any).
+    answer_attempt = None
+    if selected is not None:
+        if selected.passed_hidden_tests:
+            answer_attempt = selected
+        else:
+            answer_attempt = next(
+                (a for a in session.attempts
+                 if a.phase.value == "repair" and a.passed_hidden_tests),
+                None,
+            )
+
+    return {
+        "id":            session.id,
+        "mode":          session.mode,
+        "task_id":       session.task_id,
+        "source":        session.source,
+        "status":        session.status.value,
+        "current_stage": session.current_stage,
+        "question":      session.question,
+        # oracle_kind / oracle_tests only meaningful for interactive mode
+        "oracle_kind":   session.oracle_kind,
+        "oracle_tests":  session.oracle_tests,
+        "error_message": session.error_message,
+        "created_at":    session.created_at,
+        "completed_at":  session.completed_at,
+        "attempts":      [_attempt_detail(a) for a in session.attempts],
+        # Convenience field: id of the attempt that produced the best answer,
+        # or null when status is pending / running / failed.
+        "answer_attempt_id": answer_attempt.id if answer_attempt else None,
+        # Baseline run record (null for verified / interactive)
+        "run": _run_detail(run) if run is not None else None,
+    }
+
+
+def _run_pipeline_in_thread(
+    session_id: int,
+    mode: str,
+    task_id: str | None,
+    question: str | None,
+    code: str | None,
+    tests: list[str] | None,
+) -> None:
+    """
+    Execute a pipeline in a worker thread.
+    Opens its own DB session.  Every exception is caught and written as
+    status=failed so no session record is ever silently lost.
+    The HTTP handler has already returned to the client before this runs.
+    """
+    try:
+        if mode == "baseline":
+            BaselinePipeline(
+                OpenAIClient(), SandboxExecutor(), SessionLocal, HumanEvalLoader()
+            ).run(task_id, session_id=session_id)
+
+        elif mode == "verified":
+            VerifiedPipeline(
+                OpenAIClient(), SandboxExecutor(), SessionLocal, HumanEvalLoader()
+            ).run(task_id, session_id=session_id)
+
+        elif mode == "interactive":
+            InteractivePipeline(
+                OpenAIClient(), SandboxExecutor(), SessionLocal,
+                settings.verification_candidates, settings.max_repair_attempts,
+            ).run(question, code=code, tests=tests, session_id=session_id)
+
+    except Exception as exc:
+        # Write failed status so the record is never lost.
+        # We only update if the pipeline has not already set a terminal status
+        # (e.g. succeeded / exhausted), which would indicate the exception
+        # happened during a final bookkeeping step.
+        logger.exception("Pipeline thread failed for session %d", session_id)
+        try:
+            with SessionLocal() as db:
+                session = db.get(VerificationSession, session_id)
+                if session is not None and session.status not in (
+                    VerificationStatus.succeeded,
+                    VerificationStatus.exhausted,
+                ):
+                    session.status = VerificationStatus.failed
+                    session.current_stage = None
+                    session.completed_at = datetime.now(UTC)
+                    # Sanitise: type name + first 200 chars of message only.
+                    # Never expose LLM keys, docker socket paths, or test source.
+                    session.error_message = (
+                          f"{type(exc).__name__}: Pipeline execution failed. "
+                          "Check server logs for details."
+                      )
+                    db.commit()
+        except Exception:
+            logger.exception(
+                "Could not persist failed status for session %d", session_id
+            )
+
+
+@app.post("/sessions", status_code=202)
+async def create_session(request: CreateSessionRequest):
+    """
+    Create an async verification session.
+
+    Returns HTTP 202 immediately with the session id and ``pending`` status.
+    The pipeline runs in a background thread.  Poll ``GET /sessions/{id}``
+    to retrieve progress and final results.
+    """
+    # Validate the task id before creating a DB record.
+    loader = HumanEvalLoader()
+    if request.mode in (_SessionMode.baseline, _SessionMode.verified):
+        try:
+            loader.get(request.task_id)
+        except KeyError:
+            raise HTTPException(404, f"Unknown task_id: {request.task_id!r}")
+
+    if not _submission_slots.acquire(blocking=False):
+        raise HTTPException(
+            status_code=503,
+            detail="Server is busy. Please retry shortly."
+        )
+
+    # Create the session synchronously so we always have a stable id to return.
+    try:
+        with SessionLocal() as db:
+            session = VerificationSession(
+                task_id=request.task_id if request.task_id else "interactive",
+                mode=request.mode.value,
+                source=(
+                    "interactive" if request.mode == _SessionMode.interactive
+                    else "humaneval"
+                ),
+                question=request.question,
+                status=VerificationStatus.pending,
+                current_stage=None,
+            )
+            db.add(session)
+            db.commit()
+            db.refresh(session)
+            session_id = session.id
+    except Exception:
+        _submission_slots.release()
+        raise
+
+    # Submit to the thread pool.  Returns a Future we intentionally do not
+    # await — the thread manages its own lifecycle through the database.
+    try:
+        future = _executor.submit(
+            _run_pipeline_in_thread,
+            session_id,
+            request.mode.value,
+            request.task_id,
+            request.question,
+            request.code,
+            request.tests,
+        )
+
+        future.add_done_callback(lambda _: _submission_slots.release())
+
+    except RuntimeError as exc:
+        _submission_slots.release()
+        # Executor has been shut down (e.g. server is stopping).
+        with SessionLocal() as db:
+            session = db.get(VerificationSession, session_id)
+            if session is not None:
+                session.status = VerificationStatus.failed
+                session.error_message = f"Executor unavailable: {exc}"
+                session.completed_at = datetime.now(UTC)
+                db.commit()
+        raise HTTPException(503, "Server is shutting down; please retry.")
+
+    return {"id": session_id, "status": "pending"}
+
+
+@app.get("/sessions/{session_id}")
+def get_session(session_id: int):
+    """
+    Return the current state of a session, including all attempts committed so far.
+
+    Safe to poll repeatedly.  Attempts are committed individually as the
+    pipeline progresses, so new entries appear on each poll during execution.
+    """
+    with SessionLocal() as db:
+        session = db.get(VerificationSession, session_id)
+        if session is None:
+            raise HTTPException(404, f"Session {session_id} not found")
+
+        # Eagerly load attempts while the session is open.
+        list(session.attempts)
+
+        # For baseline mode, fetch the linked run record.
+        run: Run | None = None
+        if session.mode == "baseline":
+            run = (
+                db.query(Run)
+                .filter(Run.session_id == session_id)
+                .first()
+            )
+            if run is not None:
+                # Eagerly load test_results while the DB session is open.
+                list(run.test_results)
+
+        return _session_response(session, run)
+
+
+@app.get("/sessions")
+def list_sessions(
+    mode:   str | None = Query(default=None, description="Filter by mode: baseline | verified | interactive"),
+    status: str | None = Query(default=None, description="Filter by status: pending | running | succeeded | exhausted | failed"),
+    limit:  int        = Query(default=20, ge=1, le=100),
+    offset: int        = Query(default=0, ge=0),
+):
+    """
+    Return a paginated history of sessions, newest first.
+
+    Optional query params: ``mode``, ``status``, ``limit`` (1–100), ``offset``.
+    """
+    with SessionLocal() as db:
+        query = db.query(VerificationSession)
+        if mode:
+            query = query.filter(VerificationSession.mode == mode)
+        if status:
+            query = query.filter(VerificationSession.status == status)
+        total = query.count()
+        sessions = (
+            query.order_by(VerificationSession.created_at.desc())
+            .offset(offset)
+            .limit(limit)
+            .all()
+        )
+        return {
+            "total":  total,
+            "offset": offset,
+            "limit":  limit,
+            "sessions": [
+                {
+                    "id":            s.id,
+                    "mode":          s.mode,
+                    "task_id":       s.task_id,
+                    "status":        s.status.value,
+                    "current_stage": s.current_stage,
+                    "created_at":    s.created_at,
+                    "completed_at":  s.completed_at,
+                    "error_message": s.error_message,
+                }
+                for s in sessions
+            ],
+        }
+
+
+# ---------------------------------------------------------------------------
+# HTML UI pages — UNCHANGED
+# ---------------------------------------------------------------------------
 
 SHARED_STYLES = '''<style>
 :root {
