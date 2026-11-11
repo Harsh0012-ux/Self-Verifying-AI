@@ -12,6 +12,7 @@ import time
 from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
+from threading import BoundedSemaphore
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -51,8 +52,10 @@ def _restore_main_globals():
     m.SessionLocal = original_sl
     # Replace a shut-down executor so the next test gets a fresh one.
     if m._executor._shutdown:
-        m._executor = ThreadPoolExecutor(max_workers=5)
-
+        m._executor = ThreadPoolExecutor(max_workers=m._MAX_WORKERS)
+        m._submission_slots = BoundedSemaphore(
+            m._MAX_WORKERS + m._MAX_QUEUED
+    )
 
 @pytest.fixture()
 def db_engine():
@@ -400,15 +403,11 @@ class TestStatusTransitions:
             m._run_pipeline_in_thread(session_id, "verified", "HumanEval/0",
                                        None, None, None)
 
-        with SessionLocal() as db:
-            s = db.get(VerificationSession, session_id)
-            # The key may appear in the message (we truncate, not redact),
-            # so this test verifies the message is CAPPED at 200 chars post-colon.
-            msg = s.error_message or ""
-            # Format: "RuntimeError: <first 200 chars>"
-            parts = msg.split(": ", 1)
-            if len(parts) == 2:
-                assert len(parts[1]) <= 200
+            with SessionLocal() as db:
+                s = db.get(VerificationSession, session_id)
+                assert s.error_message is not None
+                assert FAKE_KEY not in s.error_message
+                assert "RuntimeError" in s.error_message
 
 
 # ===========================================================================

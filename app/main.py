@@ -5,6 +5,8 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 
+from threading import BoundedSemaphore
+
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field, model_validator
@@ -28,7 +30,11 @@ logger = logging.getLogger(__name__)
 # Created at module level so it is shared across all requests and shut down
 # cleanly by the lifespan handler.
 # ---------------------------------------------------------------------------
-_executor = ThreadPoolExecutor(max_workers=5)
+_MAX_WORKERS = 5
+_MAX_QUEUED = 5
+
+_executor = ThreadPoolExecutor(max_workers=_MAX_WORKERS)
+_submission_slots = BoundedSemaphore(_MAX_WORKERS + _MAX_QUEUED)
 
 
 def _get_session_local():
@@ -383,8 +389,9 @@ def _run_pipeline_in_thread(
                     # Sanitise: type name + first 200 chars of message only.
                     # Never expose LLM keys, docker socket paths, or test source.
                     session.error_message = (
-                        f"{type(exc).__name__}: {str(exc)[:200]}"
-                    )
+                          f"{type(exc).__name__}: Pipeline execution failed. "
+                          "Check server logs for details."
+                      )
                     db.commit()
         except Exception:
             logger.exception(
@@ -409,28 +416,38 @@ async def create_session(request: CreateSessionRequest):
         except KeyError:
             raise HTTPException(404, f"Unknown task_id: {request.task_id!r}")
 
-    # Create the session synchronously so we always have a stable id to return.
-    with SessionLocal() as db:
-        session = VerificationSession(
-            task_id=request.task_id if request.task_id else "interactive",
-            mode=request.mode.value,
-            source=(
-                "interactive" if request.mode == _SessionMode.interactive
-                else "humaneval"
-            ),
-            question=request.question,
-            status=VerificationStatus.pending,
-            current_stage=None,
+    if not _submission_slots.acquire(blocking=False):
+        raise HTTPException(
+            status_code=503,
+            detail="Server is busy. Please retry shortly."
         )
-        db.add(session)
-        db.commit()
-        db.refresh(session)
-        session_id = session.id
+
+    # Create the session synchronously so we always have a stable id to return.
+    try:
+        with SessionLocal() as db:
+            session = VerificationSession(
+                task_id=request.task_id if request.task_id else "interactive",
+                mode=request.mode.value,
+                source=(
+                    "interactive" if request.mode == _SessionMode.interactive
+                    else "humaneval"
+                ),
+                question=request.question,
+                status=VerificationStatus.pending,
+                current_stage=None,
+            )
+            db.add(session)
+            db.commit()
+            db.refresh(session)
+            session_id = session.id
+    except Exception:
+        _submission_slots.release()
+        raise
 
     # Submit to the thread pool.  Returns a Future we intentionally do not
     # await — the thread manages its own lifecycle through the database.
     try:
-        _executor.submit(
+        future = _executor.submit(
             _run_pipeline_in_thread,
             session_id,
             request.mode.value,
@@ -439,7 +456,11 @@ async def create_session(request: CreateSessionRequest):
             request.code,
             request.tests,
         )
+
+        future.add_done_callback(lambda _: _submission_slots.release())
+
     except RuntimeError as exc:
+        _submission_slots.release()
         # Executor has been shut down (e.g. server is stopping).
         with SessionLocal() as db:
             session = db.get(VerificationSession, session_id)
