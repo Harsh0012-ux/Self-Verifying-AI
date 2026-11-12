@@ -14,3 +14,11 @@ __pycache__/
 *.egg-info/
 evaluation_results/
 Download Mentor_Interaction_Briefing CLAUDE.pdf
+
+# Android generated files
+android/.gradle/
+android/.idea/
+android/.kotlin/
+android/build/
+android/**/build/
+android/local.properties
