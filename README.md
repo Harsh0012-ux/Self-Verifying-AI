@@ -374,7 +374,8 @@ How to read them:
 
 ## Contributors
 
-- Harsh ([@Harsh0012-ux](https://github.com/Harsh0012-ux)): sole developer. MCA (AI & DS) major project, K.R. Mangalam University.
+- Ram ([@Ram0kr0singh](https://github.com/Ram0kr0singh)): MCA (AI & DS) major project, K.R. Mangalam University.
+- Harsh ([@Harsh0012-ux](https://github.com/Harsh0012-ux)): MCA (AI & DS) major project, K.R. Mangalam University.
 
 ## References
 
